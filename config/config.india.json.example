@@ -1,0 +1,19 @@
+{
+  "_readme": "Copy this file to config.india.json (same directory) and fill in your own values. config.india.json is gitignored since it holds machine-specific paths and personal search preferences.",
+
+  "search": {
+    "titles": ["Software Engineer", "Backend Engineer", "Java Developer"],
+    "locations": ["Bangalore", "Remote"],
+    "maxResultsPerLocation": 15
+  },
+
+  "matchThresholdPercent": 50,
+
+  "resume": "resume/YourResume_IN.pdf",
+  "region": "in",
+
+  "chrome": {
+    "_readme": "A dedicated Chrome profile just for this tool -- NOT your everyday Chrome profile. Log into LinkedIn by hand in this profile once; Playwright will then reuse those cookies on every run.",
+    "profileDir": "C:/Users/kriti/AppData/Local/JobFinderChromeProfile"
+  }
+}

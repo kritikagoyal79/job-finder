@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# LinkedIn Easy Apply automation: search / apply / record-outcome. See .claude/skills/apply-jobs/SKILL.md for orchestration.
+# LinkedIn Easy Apply automation: search / apply / record-outcome. See .claude/skills/apply-jobs-india or apply-jobs-europe SKILL.md for orchestration.
 import argparse
 import json
 import sys
@@ -9,7 +9,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-MAX_EASY_APPLY_STEPS = 8
+MAX_EASY_APPLY_STEPS = 15  # some real applications (e.g. Seven Senders) legitimately run 9+ steps
 ANSWER_WAIT_TIMEOUT_SECONDS = 15 * 60
 
 
@@ -43,8 +43,14 @@ def fetch_description(context, job_url):
     page = context.new_page()
     try:
         page.goto(job_url, wait_until="domcontentloaded")
-        page.wait_for_selector("h2", timeout=10000)
-        heading = page.query_selector("xpath=//h2[contains(text(),'About the job')]")
+        # Waiting on a bare "h2" matches an earlier-rendering nav heading (e.g. "0 notifications")
+        # before the job description section has hydrated, so target the specific heading text.
+        heading_selector = "xpath=//h2[contains(text(),'About the job')]"
+        try:
+            page.wait_for_selector(heading_selector, timeout=10000)
+        except PWTimeoutError:
+            return ""
+        heading = page.query_selector(heading_selector)
         if heading:
             container = heading.query_selector("xpath=../../..")
             if container:
@@ -124,10 +130,15 @@ def cmd_search(args):
 
 # ---------- apply ----------
 
-def match_answer(question_text, answers, field_types):
+def match_answer(question_text, answers, field_types, region):
     q = question_text.lower()
     for entry in answers:
         if entry.get("field_type") not in field_types:
+            continue
+        # Currency/region-specific answers (e.g. salary figures) must not leak across regions --
+        # an INR-lakhs figure silently submitted on a EUR-denominated field would be wrong, not
+        # just imprecise. Entries without a "regions" key apply everywhere (e.g. notice period).
+        if "regions" in entry and region not in entry["regions"]:
             continue
         for substr in entry.get("match_substrings", []):
             if substr.lower() in q:
@@ -173,20 +184,24 @@ def fill_current_step(page, answers, args):
         except Exception:
             pass
 
+    labeled_ids = set()
     for label in page.query_selector_all("label[for]"):
         input_id = label.get_attribute("for")
         if not input_id:
             continue
-        field = page.query_selector(f"#{input_id}")
+        # Attribute selector, not "#id" -- LinkedIn's React-generated ids (e.g. "«rd»") contain
+        # characters that aren't valid in an unescaped CSS id selector.
+        field = page.query_selector(f"[id='{input_id}']")
         if not field or field.get_attribute("type") == "file":
             continue
+        labeled_ids.add(input_id)
         tag = field.evaluate("el => el.tagName.toLowerCase()")
         if tag not in ("input", "textarea"):
             continue
         if (field.input_value() if tag == "input" else field.inner_text()):
             continue  # already filled
         question_text = label.inner_text().strip()
-        entry = match_answer(question_text, answers, ("text",))
+        entry = match_answer(question_text, answers, ("text",), args.region)
         if entry:
             field.fill(resolve_value(entry, args.region))
             continue
@@ -195,13 +210,50 @@ def fill_current_step(page, answers, args):
             continue
         field.fill(ask_and_wait(question_text, "text", None, args.answer_pipe))
 
+    # Dropdown (<select>) screening questions -- e.g. "years of experience with X" or "which
+    # databases have you used" bucketed choices. These were previously invisible to this function
+    # entirely (the label[for] loop above only follows through for input/textarea), which is why a
+    # form with a required, still-blank dropdown looked like an infinite step-advance loop: Next
+    # kept "succeeding" while the real validation error sat on a field type nothing ever touched.
+    for select_el in page.query_selector_all("select"):
+        if select_el.evaluate("el => el.value"):
+            continue  # already has a real (non-placeholder) selection
+        select_id = select_el.get_attribute("id")
+        question_text = ""
+        if select_id:
+            lbl = page.query_selector(f"label[for='{select_id}']")
+            if lbl:
+                question_text = lbl.inner_text().strip()
+        if not question_text:
+            question_text = (select_el.get_attribute("aria-label") or "").strip()
+        options = [
+            opt.inner_text().strip()
+            for opt in select_el.query_selector_all("option")
+            if opt.get_attribute("value")
+        ]
+        required = select_el.get_attribute("required") is not None
+        if not required:
+            continue
+        entry = match_answer(question_text, answers, ("select",), args.region)
+        answer_value = resolve_value(entry, args.region) if entry else ask_and_wait(
+            question_text, "select", options, args.answer_pipe
+        )
+        matched_value = None
+        for opt in select_el.query_selector_all("option"):
+            if opt.inner_text().strip().lower() == str(answer_value).strip().lower():
+                matched_value = opt.get_attribute("value")
+                break
+        select_el.select_option(matched_value if matched_value else str(answer_value))
+        page.wait_for_timeout(500)  # let any reactive re-render (e.g. cascading fields) settle
+
     for field in page.query_selector_all("input[aria-label], textarea[aria-label]"):
-        if field.get_attribute("id"):
+        input_id = field.get_attribute("id")
+        if input_id and input_id in labeled_ids:
             continue  # already handled via label[for] above
         question_text = (field.get_attribute("aria-label") or "").strip()
         if field.input_value():
             continue
-        entry = match_answer(question_text, answers, ("text",))
+        entry = match_answer(question_text, answers, ("text",), args.region)
         if entry:
             field.fill(resolve_value(entry, args.region))
             continue
@@ -212,10 +264,52 @@ def fill_current_step(page, answers, args):
 
     for fieldset in page.query_selector_all("fieldset"):
         inputs = fieldset.query_selector_all("input[type='radio'], input[type='checkbox']")
-        if not inputs or any(i.is_checked() for i in inputs):
+        if not inputs:
             continue
+
+        fieldset_text_lower = fieldset.inner_text().lower()
+        if ".pdf" in fieldset_text_lower or ".doc" in fieldset_text_lower:
+            # LinkedIn's resume-picker also renders as a radiogroup fieldset -- it's not a
+            # screening question, so it must never fall into the yes/no answer path below.
+            # Select whichever listed resume matches the one we were asked to use; if it isn't
+            # listed, leave the existing selection rather than guess (resume content is the same
+            # across regions per config -- only the phone number differs).
+            target_name = Path(args.resume_path).name.lower()
+            for i in inputs:
+                input_id = i.get_attribute("id")
+                option_text = ""
+                if input_id:
+                    lbl = fieldset.query_selector(f"label[for='{input_id}']")
+                    if lbl:
+                        option_text = lbl.inner_text().lower()
+                if target_name in option_text and not i.is_checked():
+                    i.evaluate("el => el.click()")
+                    break
+            continue
+
+        if any(i.is_checked() for i in inputs):
+            continue
+
+        # Question text isn't always in a <legend> -- LinkedIn also puts it in aria-label or
+        # aria-labelledby on the fieldset itself. Falling straight through to fieldset.inner_text()
+        # without checking these first returns just the option words (e.g. "Yes\nNo") with no
+        # actual question, which is unusable for the user prompt and unmatchable in answers.json.
         legend = fieldset.query_selector("legend")
-        question_text = (legend.inner_text() if legend else fieldset.inner_text()).strip()
+        question_text = legend.inner_text().strip() if legend else ""
+        if not question_text:
+            question_text = (fieldset.get_attribute("aria-label") or "").strip()
+        if not question_text:
+            labelledby = fieldset.get_attribute("aria-labelledby")
+            if labelledby:
+                parts = [page.query_selector(f"[id='{ref}']") for ref in labelledby.split()]
+                question_text = " ".join(p.inner_text().strip() for p in parts if p).strip()
+        if not question_text:
+            # LinkedIn also renders the question as a plain <p> that's a preceding sibling of the
+            # fieldset in their shared parent -- not linked via any ARIA attribute at all.
+            question_text = fieldset.evaluate("el => el.previousElementSibling?.innerText?.trim() || ''")
+        if not question_text:
+            question_text = fieldset.inner_text().strip()
+        question_text = question_text.rstrip("*").strip()
 
         options = []
         for i in inputs:
@@ -225,9 +319,16 @@ def fill_current_step(page, answers, args):
                 lbl = fieldset.query_selector(f"label[for='{input_id}']")
                 if lbl:
                     label_text = lbl.inner_text().strip()
+            if not label_text:
+                label_text = (i.get_attribute("aria-label") or "").strip() or None
+            if not label_text:
+                # The <label for> element is often empty -- the visible "Yes"/"No" text instead
+                # sits in a sibling <p> inside the same role="radio" wrapper div.
+                wrapper_text = i.evaluate("el => el.closest('[role=\"radio\"], [role=\"checkbox\"]')?.innerText?.trim() || ''")
+                label_text = wrapper_text or None
             options.append(label_text or i.get_attribute("value") or "")
 
-        entry = match_answer(question_text, answers, ("yes_no", "radio"))
+        entry = match_answer(question_text, answers, ("yes_no", "radio"), args.region)
         if entry:
             value = resolve_value(entry, args.region)
             answer_value = ("Yes" if str(value).lower() in ("yes", "true") else "No") \
@@ -253,42 +354,68 @@ def cmd_apply(args):
         page = context.pages[0] if context.pages else context.new_page()
         try:
             page.goto(args.job_url, wait_until="domcontentloaded")
+            # domcontentloaded fires before LinkedIn's SPA hydrates the apply-button area, so wait
+            # for one of the possible outcomes to actually render before deciding (same class of
+            # race as fetch_description's earlier bug).
+            indicator_selector = (
+                "xpath=//button[contains(@aria-label,'Easy Apply')] | "
+                "//a[contains(@aria-label,'Apply on company website')] | "
+                "//*[contains(text(),'No longer accepting applications')] | "
+                "//button[contains(.,\"I'm interested\")]"
+            )
+            try:
+                page.wait_for_selector(indicator_selector, timeout=15000)
+            except PWTimeoutError:
+                log_event({"event": "error", "reason": "page did not settle (no apply indicator rendered)"})
+                return
 
             if page.query_selector("xpath=//*[contains(text(),'No longer accepting applications')]"):
                 log_event({"event": "error", "reason": "listing closed"})
                 return
 
-            easy_apply_btn = page.query_selector("xpath=//button[contains(@aria-label,'Easy Apply')]")
-            if not easy_apply_btn:
+            if page.query_selector("xpath=//a[contains(@aria-label,'Apply on company website')]"):
+                log_event({"event": "error", "reason": "external apply only, not Easy Apply"})
+                return
+
+            if page.query_selector("xpath=//button[contains(.,\"I'm interested\")]") and not page.query_selector(
+                "xpath=//button[contains(@aria-label,'Easy Apply')]"
+            ):
+                log_event({"event": "error", "reason": "interested-only listing, no direct apply mechanism"})
+                return
+
+            if page.locator("xpath=//button[contains(@aria-label,'Easy Apply')]").count() == 0:
                 log_event({"event": "error", "reason": "no Easy Apply button found"})
                 return
-            easy_apply_btn.click()
+            # Locator.click() re-resolves the element right before acting, unlike a query_selector
+            # handle -- LinkedIn sometimes re-renders this button shortly after paint, which made a
+            # held ElementHandle throw "not attached to the DOM" on click.
+            page.locator("xpath=//button[contains(@aria-label,'Easy Apply')]").first.click(timeout=15000)
             page.wait_for_timeout(1000)
 
             for step in range(1, MAX_EASY_APPLY_STEPS + 1):
                 fill_current_step(page, answers, args)
 
-                submit_btn = page.query_selector(
+                submit_selector = (
                     "xpath=//button[contains(@aria-label,'Submit application') or "
                     "normalize-space(.)='Submit application' or normalize-space(.)='Submit']"
                 )
-                if submit_btn:
-                    submit_btn.click()
+                if page.locator(submit_selector).count() > 0:
+                    page.locator(submit_selector).first.click(timeout=10000)
                     page.wait_for_timeout(1500)
                     log_event({"event": "applied", "jobId": args.job_id})
                     return
 
-                next_btn = page.query_selector(
+                next_selector = (
                     "xpath=//button[contains(@aria-label,'Continue to next step') or "
                     "contains(@aria-label,'Review your application') or "
                     "normalize-space(.)='Next' or normalize-space(.)='Review' or "
                     "normalize-space(.)='Continue']"
                 )
-                if not next_btn:
+                if page.locator(next_selector).count() == 0:
                     log_event({"event": "error", "reason": "no Next/Submit button found on step"})
                     return
 
-                next_btn.click()
+                page.locator(next_selector).first.click(timeout=10000)
                 try:
                     page.wait_for_selector(
                         "xpath=//button[contains(@aria-label,'Continue to next step')]",
@@ -297,6 +424,22 @@ def cmd_apply(args):
                 except PWTimeoutError:
                     pass
                 page.wait_for_timeout(800)
+
+                # A timed-out detach above doesn't necessarily mean nothing changed -- confirm by
+                # checking for LinkedIn's own validation error text, rather than silently assuming
+                # the click advanced the wizard (a prior version of this code did that and looped
+                # on the same stuck step until it hit the step cap).
+                error_el = (
+                    page.query_selector("div.artdeco-inline-feedback--error, span[class*='error-message']")
+                    or page.query_selector("xpath=//*[normalize-space(text())='Invalid input']")
+                )
+                if error_el:
+                    log_event({
+                        "event": "error",
+                        "reason": f"step did not advance, validation error present: {error_el.inner_text().strip()[:200]}",
+                    })
+                    return
+
                 log_event({"event": "step_advanced", "step": step + 1})
 
             log_event({"event": "error", "reason": f"exceeded {MAX_EASY_APPLY_STEPS} steps"})

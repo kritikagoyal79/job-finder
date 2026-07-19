@@ -10,6 +10,10 @@ venv/
 ### VS Code ###
 .vscode/
 
+### IntelliJ (stale from the old Java project) ###
+.idea/
+
 ### JobFinder ###
-config/config.json
+config/config.india.json
+config/config.europe.json
 data/
