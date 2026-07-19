@@ -69,7 +69,10 @@ def cmd_search(args):
         sys.exit(1)
     seen = load_json(args.seen, {})
 
-    titles = config["search"]["titles"]
+    # --titles (derived by Claude from whatever resume is currently in resume/) overrides the
+    # config's static list, so search terms track the profile in use instead of staying fixed to
+    # whoever originally set the config up.
+    titles = [t.strip() for t in args.titles.split(",")] if args.titles else config["search"]["titles"]
     locations = config["search"]["locations"]
     max_per_location = config["search"].get("maxResultsPerLocation", 25)
     profile_dir = config["chrome"]["profileDir"]
@@ -468,6 +471,12 @@ def main():
     p_search.add_argument("--config", required=True)
     p_search.add_argument("--seen", required=True)
     p_search.add_argument("--run-timestamp", dest="run_timestamp", required=True)
+    p_search.add_argument(
+        "--titles",
+        default=None,
+        help="Comma-separated job titles to search, overriding config's search.titles "
+             "(intended to be derived from the current resume rather than typed by hand)",
+    )
     p_search.set_defaults(func=cmd_search)
 
     p_apply = sub.add_parser("apply")

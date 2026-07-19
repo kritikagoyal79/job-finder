@@ -2,6 +2,7 @@
   "_readme": "Copy this file to config.europe.json (same directory) and fill in your own values. config.europe.json is gitignored since it holds machine-specific paths and personal search preferences. Locations here also cover Japan-based roles, which use the same EU resume/answers per prior convention.",
 
   "search": {
+    "_readme": "titles is now a fallback only -- the skill derives search titles from the resume each run and passes them to the script directly. Fill this in with something reasonable anyway in case the resume can't be read for some reason.",
     "titles": ["Software Engineer", "Backend Engineer", "Java Developer"],
     "locations": ["Remote", "Germany", "Netherlands", "Ireland", "Japan"],
     "maxResultsPerLocation": 15
