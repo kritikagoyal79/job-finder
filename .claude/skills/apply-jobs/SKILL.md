@@ -1,41 +1,105 @@
 ---
 name: apply-jobs
-description: Run the JobFinder daily job-search-and-apply workflow - search portals for new matching jobs, review staged matches with the user, and submit applications only for the ones they approve. Use when the user asks to run/check JobFinder, find new jobs, or apply to jobs today.
+description: Run the JobFinder LinkedIn job-search-and-apply workflow - search LinkedIn for new jobs, judge fit against the resume, and auto-apply via Easy Apply when the match is good and all screening questions can be answered. Use when the user asks to run/check JobFinder, find new jobs, or apply to jobs today.
 ---
 
-# Apply Jobs (JobFinder daily run)
+# Apply Jobs (JobFinder LinkedIn run)
 
-This skill drives JobFinder's search -> review -> approve -> apply pipeline for one sitting. It never submits an application without the user explicitly picking which staged job IDs to approve — that's a deliberate design constraint of this project (see `C:\Users\kriti\.claude\plans\idempotent-singing-goose.md`), not something to change without the user asking.
+This skill drives a search -> judge -> apply pipeline for one sitting, LinkedIn only. Unlike the
+project's earlier design, it applies automatically once a job clears the match threshold and every
+screening question has an answer — it does not stop for per-job approval. That auto-apply behavior
+was an explicit choice the user made (accepting LinkedIn ToS/account-risk tradeoffs); don't add a
+manual approval gate back in without the user asking.
 
 Run all commands from the repo root (`C:\Users\kriti\Desktop\projects\JobFinder`).
 
+## Setup (check every run, only act if missing)
+
+1. `config/config.json` must exist — if missing, tell the user to copy `config/config.json.example`
+   to `config/config.json`, fill in search titles/locations, and make sure they've logged into
+   LinkedIn by hand once in the dedicated Chrome profile at `chrome.profileDir`. Don't proceed
+   without it.
+2. Playwright must be installed — run `python -m playwright --version`. If it fails, tell the user
+   to run (one-time): `pip install -r scripts/requirements.txt` then `playwright install chrome`.
+   Don't proceed without it.
+
 ## Steps
 
-1. **Check config exists.** If `config/jobfinder.properties` is missing, stop and tell the user to copy `config/jobfinder.properties.example` to `config/jobfinder.properties`, fill in their search titles/locations, and make sure they've logged into the enabled portals (Indeed/Naukri by default) once in the dedicated Chrome profile referenced by `chrome.profileDir`. Don't proceed until it exists.
+1. **Compute a run timestamp** once, e.g. `date +%Y-%m-%d_%H%M%S`. Both log files for this run are
+   `data/logs/<timestamp>_applied.jsonl` and `data/logs/<timestamp>_skipped.jsonl` — created lazily
+   (first append) via Bash heredocs, e.g.:
+   ```
+   cat >> data/logs/<timestamp>_applied.jsonl <<'EOF'
+   {"jobId": "...", "title": "...", ...}
+   EOF
+   ```
+   Always use a quoted heredoc delimiter (`<<'EOF'`) so the JSON content isn't shell-expanded.
 
-2. **Run search.** Execute:
+2. **Search.** Run:
    ```
-   ./gradlew run --args="search"
+   python scripts/linkedin.py search --config config/config.json --seen data/seen_jobs.json --run-timestamp <timestamp>
    ```
-   This opens a real (non-headless) Chrome window using the user's dedicated profile and scans every portal listed in `portals.enabled`. Show the per-portal summary output (found/staged/below-threshold/already-seen counts) to the user. The CSV store at `store.csvPath` means jobs already seen in a previous day's run are automatically skipped — that's expected, not a bug.
+   This opens a real (non-headless) Chrome window on the dedicated profile, searches every
+   title x location combination from config, and prints a JSON array of **new** postings (jobs
+   already in `data/seen_jobs.json` are skipped automatically — expected, not a bug) — each with
+   id, title, company, location, url, and full description text.
 
-3. **Run list.** Execute:
-   ```
-   ./gradlew run --args="list"
-   ```
-   Show the full staged list to the user: id, match %, title, company, portal, url, and matched keywords.
+3. **For each job returned, in order:**
+   a. Read the resume(s) in `resume/` via the `Read` tool (once per run, reuse across jobs) and
+      compare against the job's description. Judge a 0-100% match with brief reasoning (which
+      required skills are present/missing) — this is Claude's own semantic judgment, not a
+      keyword-overlap script.
+   b. **Match < 50%:** append a line to `_skipped.jsonl` (`jobId, title, company, url, matchPercent,
+      reason: "below threshold", reasoning`). Move to the next job — no browser interaction for
+      this one.
+   c. **Match >= 50%:** decide which named resume fits (`resume.in` for India-based roles,
+      `resume.eu` for Europe/Japan/other — Claude's own judgment from the job's location text) and
+      the matching region tag (`in` or `eu`). Then run:
+      ```
+      python scripts/linkedin.py apply --job-id <id> --job-url <url> --resume-path <resolved path> \
+        --region <in|eu> --profile-dir <chrome.profileDir from config> --answers data/answers.json \
+        --answer-pipe <a scratch path, e.g. data/.answer_pipe_<id>.json>
+      ```
+      via `Bash(run_in_background: true)`, and follow it with `Monitor` (each stdout line is one
+      JSON event).
 
-4. **Get explicit approval.** Ask the user which staged job IDs (if any) they want to apply to today — do not assume "all of them." If the list is short, use AskUserQuestion with the option to select specific ids or "none right now." If nothing is staged, or the user picks none, stop here.
+4. **Handle apply events as they arrive:**
+   - `step_advanced` — informational, no action needed.
+   - `question_pending` (`question`, `field_type`, `options`, `required`) — this is a screening
+     question the script's pattern list in `data/answers.json` didn't recognize. Ask the user (use
+     `AskUserQuestion` if `options` is a non-empty list; otherwise ask directly in chat). Once
+     answered, write the answer to the `--answer-pipe` path as `{"answer": "<their answer>"}` via
+     the `Write` tool — the script is polling for that file and will resume once it appears.
+     After the job's outcome event arrives, judge whether this Q&A is **generic and reusable**
+     (salary expectation, notice period, visa/work permit, relocation, gender/EEO, phone, location,
+     years of experience, etc.) versus **company-specific** (e.g. "why do you want to join
+     Acme?"). If generic, append a new entry to `data/answers.json` (same shape as existing
+     entries: `category`, `match_substrings`, `field_type`, `value` or `value_by_region`) so future
+     runs match it automatically without asking again. Company-specific answers are used once and
+     not persisted.
+   - `applied` — append a full record to `_applied.jsonl`: jobId, title, company, url, matchPercent,
+     reasoning, resumeUsed, and every question asked during this application with its answer and
+     whether it came from `answers.json` or was newly asked. Then run
+     `python scripts/linkedin.py record-outcome --job-id <id> --status applied --seen data/seen_jobs.json --run-timestamp <timestamp>`.
+   - `error` (`reason`) — selector mismatch, closed listing, no Easy Apply button, exceeded step
+     limit, or the user declined/timed out on a question. Append to `_skipped.jsonl` with the
+     reason. Do **not** mark it in `seen_jobs.json` (unlike below-threshold skips) — leave it
+     eligible for retry next run in case selectors or answers improve. Report the error clearly to
+     the user rather than retrying blindly; if it looks like a LinkedIn DOM/selector change, point
+     at `scripts/linkedin.py` (LinkedIn changes markup periodically — the selectors are best-effort
+     and may need recalibration).
 
-5. **Run apply for approved IDs only.** Execute:
-   ```
-   ./gradlew run --args="apply --ids <comma-separated ids the user approved>"
-   ```
-   This reuses the same visible Chrome window/profile. Note for the user: only Indeed and Naukri are fully wired up; the apply() calls for both currently click the portal's Apply button and then report back that the multi-step application wizard needs manual completion — watch the browser and finish the submission by hand when prompted. Report each job's outcome (applied / needs manual completion / failed with reason) back to the user.
-
-6. **Summarize.** One short summary: how many new jobs staged today, how many applied, how many still awaiting the user's review (`list` again if they want to see what's left).
+5. **Summarize.** One short summary: jobs found, skipped below threshold, applied, failed —
+   plus the paths to today's two log files.
 
 ## Notes
 
-- Never expand `portals.enabled` or flip a portal from "scaffolded" to "default enabled" as part of running this skill — that's a deliberate scope decision the user made, not something to silently change.
-- If `search` or `apply` errors because a portal's selectors don't match the live DOM (zero results, exceptions), report that clearly rather than retrying blindly — those selectors are best-effort and may need the user's input to fix (see the portal's class in `src/main/java/org/example/jobfinder/portal/impl/`).
+- Never re-introduce a per-job manual-approval gate, and never re-enable other portals
+  (Indeed/Naukri/etc.) as part of running this skill — LinkedIn-only auto-apply is a deliberate
+  scope decision the user made, not something to silently expand.
+- `data/answers.json` is the growing memory of reusable screening-question answers — treat it as
+  precious. Only add entries there for genuinely reusable answers; keep company-specific answers
+  out of it.
+- If `search` or `apply` come back empty/wrong repeatedly, LinkedIn's DOM likely changed — say so
+  plainly rather than guessing new selectors blind; the user can watch the Chrome window (it runs
+  visibly, not headless) to help diagnose.
