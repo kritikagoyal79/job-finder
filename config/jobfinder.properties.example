@@ -1,0 +1,46 @@
+# Copy this file to jobfinder.properties (same directory) and fill in your own values.
+# jobfinder.properties is gitignored since it holds machine-specific paths and personal search preferences.
+
+search.titles=Software Engineer,Backend Engineer,Java Developer
+search.locations=Bangalore,Remote
+# Optional: override the location list for one portal specifically, e.g. to search more broadly
+# on a portal with global reach while keeping others scoped to nearby/relevant locations:
+# search.locations.linkedin=Bangalore,Remote,Germany,Japan
+search.maxResultsPerLocation=25
+
+match.thresholdPercent=70
+
+# Only indeed and naukri are fully implemented/tested. Add wellfound, instahyre, linkedin, monster
+# yourself once you've calibrated their selectors against the live sites (see README).
+portals.enabled=indeed,naukri
+
+resume.path=src/main/resources/Kritika_Goyal_FlowCV_Resume_2026-06-27.pdf
+
+# A dedicated Chrome profile just for this tool -- NOT your everyday Chrome profile.
+# Log into each portal by hand in this profile once; Selenium will then reuse those
+# cookies on every run. Using your daily-driver profile will fail with
+# "user data directory is already in use" whenever a normal Chrome window is open.
+chrome.profileDir=C:/Users/kriti/AppData/Local/JobFinderChromeProfile
+chrome.profileName=Default
+
+# Reference values for LinkedIn Easy Apply auto-fill (LinkedInPortal.apply()). Region is "in" or
+# "eu"; jobs are matched to a region by keywords in the job's location text (India cities -> in,
+# everything else -> eu). Optional yes/no answers below are only consulted when a matching
+# screening question actually appears on a job.
+resume.path.in=src/main/resources/YourResume_IN.pdf
+apply.phone.in=+91 0000000000
+apply.currentLocation.in=Bangalore
+apply.noticePeriod.in=30 days
+
+resume.path.eu=src/main/resources/YourResume_EU.pdf
+apply.phone.eu=+00 000000000
+apply.currentLocation.eu=Berlin
+apply.noticePeriod.eu=30 days
+
+# apply.comfortableWithJapaneseInterview=yes
+# apply.openToRelocate=yes
+# apply.needVisaSponsorship=yes
+# apply.canSubmitJapaneseResumeDocs=no
+# apply.japaneseProficiencyLevel=0
+
+store.csvPath=data/jobfinder.csv
