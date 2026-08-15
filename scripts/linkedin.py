@@ -17,6 +17,25 @@ def log_event(event: dict):
     print(json.dumps(event), flush=True)
 
 
+def dump_debug_state(page, args):
+    # Captured only on unrecognized-step failures so a stuck Easy Apply form can be diagnosed
+    # after the fact instead of re-reproducing it live -- screenshot for the visual layout, HTML
+    # for the exact selectors/aria-labels LinkedIn actually shipped on that step.
+    debug_dir = Path(args.answers).parent / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    base = debug_dir / f"{args.job_id}_{stamp}"
+    try:
+        page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+    except Exception:
+        pass
+    try:
+        base.with_suffix(".html").write_text(page.content(), encoding="utf-8")
+    except Exception:
+        pass
+    return str(base)
+
+
 def load_json(path, default):
     p = Path(path)
     if not p.exists():
@@ -186,6 +205,29 @@ def fill_current_step(page, answers, args):
             page.wait_for_timeout(500)
         except Exception:
             pass
+    else:
+        # Some Easy Apply resume steps render only an "Upload resume" button with no
+        # <input type="file"> anywhere in the DOM until it's clicked -- LinkedIn opens a
+        # native OS file-chooser dialog on click instead, which set_input_files can't
+        # target. Left unhandled, the step silently stays on "resume required" and the
+        # apply loop burns through MAX_EASY_APPLY_STEPS re-clicking Next against it.
+        upload_btn = None
+        for b in page.query_selector_all("button"):
+            try:
+                text = b.inner_text().strip().lower()
+            except Exception:
+                continue
+            if "upload resume" in text:
+                upload_btn = b
+                break
+        if upload_btn:
+            try:
+                with page.expect_file_chooser(timeout=5000) as fc_info:
+                    upload_btn.click()
+                fc_info.value.set_files(args.resume_path)
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
 
     labeled_ids = set()
     for label in page.query_selector_all("label[for]"):
@@ -362,9 +404,9 @@ def cmd_apply(args):
             # race as fetch_description's earlier bug).
             indicator_selector = (
                 "xpath=//button[contains(@aria-label,'Easy Apply')] | "
-                "//a[contains(@aria-label,'Apply on company website')] | "
+                "//*[self::a or self::button][contains(@aria-label,'Apply on company website')] | "
                 "//*[contains(text(),'No longer accepting applications')] | "
-                "//button[contains(.,\"I'm interested\")]"
+                "//button[contains(.,\"I'm interested\") or contains(.,\"I’m interested\")]"
             )
             try:
                 page.wait_for_selector(indicator_selector, timeout=15000)
@@ -376,11 +418,15 @@ def cmd_apply(args):
                 log_event({"event": "error", "reason": "listing closed"})
                 return
 
-            if page.query_selector("xpath=//a[contains(@aria-label,'Apply on company website')]"):
+            if page.query_selector(
+                "xpath=//*[self::a or self::button][contains(@aria-label,'Apply on company website')]"
+            ):
                 log_event({"event": "error", "reason": "external apply only, not Easy Apply"})
                 return
 
-            if page.query_selector("xpath=//button[contains(.,\"I'm interested\")]") and not page.query_selector(
+            if page.query_selector(
+                "xpath=//button[contains(.,\"I'm interested\") or contains(.,\"I’m interested\")]"
+            ) and not page.query_selector(
                 "xpath=//button[contains(@aria-label,'Easy Apply')]"
             ):
                 log_event({"event": "error", "reason": "interested-only listing, no direct apply mechanism"})
@@ -398,8 +444,12 @@ def cmd_apply(args):
             for step in range(1, MAX_EASY_APPLY_STEPS + 1):
                 fill_current_step(page, answers, args)
 
+                # LinkedIn has shipped both long aria-labels ("Submit application", "Continue to
+                # next step") and short ones ("Submit", "Next") with empty visible button text
+                # across different rollouts -- match both forms rather than assume one.
                 submit_selector = (
                     "xpath=//button[contains(@aria-label,'Submit application') or "
+                    "@aria-label='Submit' or "
                     "normalize-space(.)='Submit application' or normalize-space(.)='Submit']"
                 )
                 if page.locator(submit_selector).count() > 0:
@@ -411,11 +461,17 @@ def cmd_apply(args):
                 next_selector = (
                     "xpath=//button[contains(@aria-label,'Continue to next step') or "
                     "contains(@aria-label,'Review your application') or "
+                    "@aria-label='Next' or @aria-label='Review' or @aria-label='Continue' or "
                     "normalize-space(.)='Next' or normalize-space(.)='Review' or "
                     "normalize-space(.)='Continue']"
                 )
                 if page.locator(next_selector).count() == 0:
-                    log_event({"event": "error", "reason": "no Next/Submit button found on step"})
+                    debug_path = dump_debug_state(page, args)
+                    log_event({
+                        "event": "error",
+                        "reason": "no Next/Submit button found on step",
+                        "debug": debug_path,
+                    })
                     return
 
                 page.locator(next_selector).first.click(timeout=10000)
