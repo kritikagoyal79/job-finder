@@ -144,7 +144,13 @@ def cmd_search(args):
                         seen[external_id] = {"status": "seen", "lastSeenRun": args.run_timestamp}
                         found_for_location += 1
         finally:
-            context.close()
+            # A close() failure here (e.g. the browser already crashed/closed itself) must not
+            # skip the save/print below -- that would silently discard every result already
+            # scraped in this run, which is worse than leaving a dead context handle around.
+            try:
+                context.close()
+            except Exception:
+                pass
 
     save_json(args.seen, seen)
     print(json.dumps(results))
