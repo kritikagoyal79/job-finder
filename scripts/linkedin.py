@@ -98,6 +98,7 @@ def cmd_search(args):
 
     results = []
     with sync_playwright() as p:
+        print("[search] launching Chrome", file=sys.stderr, flush=True)
         context = launch_context(p, profile_dir)
         page = context.pages[0] if context.pages else context.new_page()
         try:
@@ -110,6 +111,9 @@ def cmd_search(args):
                         "https://www.linkedin.com/jobs/search/?keywords="
                         f"{urllib.parse.quote(title)}&location={urllib.parse.quote(location)}"
                     )
+                    # Progress goes to stderr (stdout must stay a single JSON array) so a stalled
+                    # run shows where it got stuck instead of hanging silently.
+                    print(f"[search] {location} / {title} ({found_for_location} so far)", file=sys.stderr, flush=True)
                     page.goto(url, wait_until="domcontentloaded")
                     try:
                         page.wait_for_selector(
@@ -117,6 +121,7 @@ def cmd_search(args):
                             timeout=15000,
                         )
                     except PWTimeoutError:
+                        print(f"[search] no results list for {location} / {title}", file=sys.stderr, flush=True)
                         continue
                     time.sleep(2)  # virtualized list settling
 
@@ -132,6 +137,7 @@ def cmd_search(args):
                         company_el = card.query_selector("div.artdeco-entity-lockup__subtitle")
                         location_el = card.query_selector("div.artdeco-entity-lockup__caption")
                         job_url = f"https://www.linkedin.com/jobs/view/{external_id}/"
+                        print(f"[search]   fetching {external_id}", file=sys.stderr, flush=True)
 
                         results.append({
                             "id": external_id,
@@ -444,11 +450,44 @@ def cmd_apply(args):
             # Locator.click() re-resolves the element right before acting, unlike a query_selector
             # handle -- LinkedIn sometimes re-renders this button shortly after paint, which made a
             # held ElementHandle throw "not attached to the DOM" on click.
-            page.locator("xpath=//button[contains(@aria-label,'Easy Apply')]").first.click(timeout=15000)
-            page.wait_for_timeout(1000)
+            # A fixed 1s pause wasn't enough: the modal sometimes renders slowly, or the first click
+            # lands on a button mid-re-render and is swallowed, leaving the job page with no form.
+            # Wait for the modal's first-step controls, re-clicking once if they never show up.
+            # LinkedIn currently renders the modal as a native <dialog open> (no role attribute);
+            # older rollouts used <div role="dialog"> -- accept either.
+            open_dialog_selector = "xpath=//dialog[@open] | //div[@role='dialog']"
+            modal_ready_selector = (
+                "xpath=(//dialog[@open] | //div[@role='dialog'])//button[contains(@aria-label,'Continue to next step') or "
+                "contains(@aria-label,'Review your application') or contains(@aria-label,'Submit application') or "
+                "@aria-label='Next' or @aria-label='Review' or @aria-label='Submit' or "
+                "normalize-space(.)='Next' or normalize-space(.)='Review' or normalize-space(.)='Submit']"
+            )
+            for attempt in range(2):
+                # Never re-click while a dialog is already open -- it covers the button, so the
+                # click just times out (and the open dialog may simply have different controls).
+                if attempt > 0 and page.locator(open_dialog_selector).count() > 0:
+                    break
+                page.locator("xpath=//button[contains(@aria-label,'Easy Apply')]").first.click(timeout=15000)
+                try:
+                    page.wait_for_selector(modal_ready_selector, timeout=10000)
+                    break
+                except PWTimeoutError:
+                    continue
+            page.wait_for_timeout(500)
 
             for step in range(1, MAX_EASY_APPLY_STEPS + 1):
-                fill_current_step(page, answers, args)
+                # Answering one question (e.g. clicking a radio) can make LinkedIn re-render the
+                # rest of the form, detaching the element handles fill_current_step collected up
+                # front. Re-running it re-queries fresh handles; already-answered fields are skipped
+                # (checked radios / filled inputs), so nothing gets asked or filled twice.
+                for fill_attempt in range(3):
+                    try:
+                        fill_current_step(page, answers, args)
+                        break
+                    except Exception as e:
+                        if "not attached to the DOM" not in str(e) or fill_attempt == 2:
+                            raise
+                        page.wait_for_timeout(500)
 
                 # LinkedIn has shipped both long aria-labels ("Submit application", "Continue to
                 # next step") and short ones ("Submit", "Next") with empty visible button text
@@ -507,7 +546,13 @@ def cmd_apply(args):
 
                 log_event({"event": "step_advanced", "step": step + 1})
 
-            log_event({"event": "error", "reason": f"exceeded {MAX_EASY_APPLY_STEPS} steps"})
+            # Usually means Next keeps "succeeding" while a validation error pins the form to one
+            # step -- capture it so the blocking field can be identified.
+            log_event({
+                "event": "error",
+                "reason": f"exceeded {MAX_EASY_APPLY_STEPS} steps",
+                "debug": dump_debug_state(page, args),
+            })
         except TimeoutError as e:
             log_event({"event": "error", "reason": str(e)})
         except Exception as e:
