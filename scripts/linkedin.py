@@ -125,30 +125,53 @@ def cmd_search(args):
                         continue
                     time.sleep(2)  # virtualized list settling
 
-                    for card in page.query_selector_all("li[data-occludable-job-id]"):
+                    # The list is virtualized: scrolling re-renders cards, which detaches any
+                    # ElementHandle collected up front. Snapshot ids first, then address each card
+                    # through a fresh locator so it re-resolves after every re-render.
+                    card_ids = [
+                        cid for cid in page.eval_on_selector_all(
+                            "li[data-occludable-job-id]",
+                            "els => els.map(e => e.getAttribute('data-occludable-job-id'))",
+                        ) if cid
+                    ]
+                    for external_id in card_ids:
                         if found_for_location >= max_per_location:
                             break
-                        external_id = card.get_attribute("data-occludable-job-id")
-                        if not external_id or external_id in seen:
+                        if external_id in seen:
                             continue
-                        card.scroll_into_view_if_needed()
-                        time.sleep(0.3)
-                        title_el = card.query_selector("a.job-card-list__title--link strong")
-                        company_el = card.query_selector("div.artdeco-entity-lockup__subtitle")
-                        location_el = card.query_selector("div.artdeco-entity-lockup__caption")
+                        card = page.locator(f"li[data-occludable-job-id='{external_id}']").first
+
+                        def card_text(selector):
+                            el = card.locator(selector).first
+                            return el.inner_text(timeout=3000).strip() if el.count() else ""
+
+                        try:
+                            card.scroll_into_view_if_needed(timeout=5000)
+                            time.sleep(0.3)
+                            job_title = card_text("a.job-card-list__title--link strong")
+                            company = card_text("div.artdeco-entity-lockup__subtitle")
+                            job_location = card_text("div.artdeco-entity-lockup__caption")
+                        except Exception as e:  # card vanished mid-render; metadata is best-effort
+                            print(f"[search]   card {external_id} unreadable: {e}".splitlines()[0],
+                                  file=sys.stderr, flush=True)
+                            job_title = company = job_location = ""
                         job_url = f"https://www.linkedin.com/jobs/view/{external_id}/"
                         print(f"[search]   fetching {external_id}", file=sys.stderr, flush=True)
 
                         results.append({
                             "id": external_id,
-                            "title": title_el.inner_text().strip() if title_el else title,
-                            "company": company_el.inner_text().strip() if company_el else "",
-                            "location": location_el.inner_text().strip() if location_el else location,
+                            "title": job_title or title,
+                            "company": company,
+                            "location": job_location or location,
                             "url": job_url,
                             "description": fetch_description(context, job_url),
                         })
                         seen[external_id] = {"status": "seen", "lastSeenRun": args.run_timestamp}
                         found_for_location += 1
+        except Exception as e:
+            # Stop searching but still save/print what was gathered -- an unexpected error midway
+            # used to discard every result already scraped this run.
+            print(f"[search] aborted early: {e}".splitlines()[0], file=sys.stderr, flush=True)
         finally:
             # A close() failure here (e.g. the browser already crashed/closed itself) must not
             # skip the save/print below -- that would silently discard every result already
@@ -255,13 +278,18 @@ def fill_current_step(page, answers, args):
         tag = field.evaluate("el => el.tagName.toLowerCase()")
         if tag not in ("input", "textarea"):
             continue
-        if (field.input_value() if tag == "input" else field.inner_text()):
-            continue  # already filled
         question_text = label.inner_text().strip()
+        current = field.input_value()
         entry = match_answer(question_text, answers, ("text",), args.region)
         if entry:
-            field.fill(resolve_value(entry, args.region))
+            # Saved answers win over LinkedIn's profile pre-fill, e.g. a "+91 ..." mobile number
+            # that fails "digits only" validation once the country code is its own dropdown.
+            value = str(resolve_value(entry, args.region))
+            if current.strip() != value:
+                field.fill(value)
             continue
+        if current:
+            continue  # already filled
         required = field.get_attribute("required") is not None or field.get_attribute("aria-required") == "true"
         if not required:
             continue
@@ -273,8 +301,6 @@ def fill_current_step(page, answers, args):
     # form with a required, still-blank dropdown looked like an infinite step-advance loop: Next
     # kept "succeeding" while the real validation error sat on a field type nothing ever touched.
     for select_el in page.query_selector_all("select"):
-        if select_el.evaluate("el => el.value"):
-            continue  # already has a real (non-placeholder) selection
         select_id = select_el.get_attribute("id")
         question_text = ""
         if select_id:
@@ -283,23 +309,36 @@ def fill_current_step(page, answers, args):
                 question_text = lbl.inner_text().strip()
         if not question_text:
             question_text = (select_el.get_attribute("aria-label") or "").strip()
-        options = [
-            opt.inner_text().strip()
-            for opt in select_el.query_selector_all("option")
-            if opt.get_attribute("value")
-        ]
-        required = select_el.get_attribute("required") is not None
-        if not required:
-            continue
+        question_text = question_text.rstrip("*").strip()
+        option_els = [o for o in select_el.query_selector_all("option") if o.get_attribute("value")]
+        options = [o.inner_text().strip() for o in option_els]
+
         entry = match_answer(question_text, answers, ("select",), args.region)
-        answer_value = resolve_value(entry, args.region) if entry else ask_and_wait(
-            question_text, "select", options, args.answer_pipe
-        )
-        matched_value = None
-        for opt in select_el.query_selector_all("option"):
-            if opt.inner_text().strip().lower() == str(answer_value).strip().lower():
-                matched_value = opt.get_attribute("value")
-                break
+        if not entry and sorted(o.lower() for o in options) == ["no", "yes"]:
+            # A Yes/No dropdown is the same question as a yes/no radio -- reuse those answers.
+            entry = match_answer(question_text, answers, ("yes_no",), args.region)
+        current_text = select_el.evaluate("el => el.value ? el.options[el.selectedIndex].text.trim() : ''")
+        if entry:
+            answer_value = resolve_value(entry, args.region)
+            if entry.get("field_type") == "yes_no":
+                answer_value = "Yes" if str(answer_value).lower() in ("yes", "true") else "No"
+            # Answered selects are enforced even when LinkedIn pre-fills them from the profile --
+            # e.g. "Phone country code" defaulting to Germany (+49) on an India application.
+            if current_text.lower() == str(answer_value).strip().lower():
+                continue
+        else:
+            if current_text or select_el.get_attribute("required") is None:
+                continue  # pre-filled or optional, and nothing saved that says otherwise
+            answer_value = ask_and_wait(question_text, "select", options, args.answer_pipe)
+
+        want = str(answer_value).strip().lower()
+        matched_value = next((o.get_attribute("value") for o, t in zip(option_els, options) if t.lower() == want), None)
+        if matched_value is None:
+            # Saved answers are phrased generically ("30 days", "India") while option lists vary
+            # ("30 days or less", "India (+91)") -- accept a unique prefix/containment match.
+            loose = [o.get_attribute("value") for o, t in zip(option_els, options)
+                     if t.lower().startswith(want) or want in t.lower()]
+            matched_value = loose[0] if len(loose) == 1 else None
         select_el.select_option(matched_value if matched_value else str(answer_value))
         page.wait_for_timeout(500)  # let any reactive re-render (e.g. cascading fields) settle
 
@@ -308,11 +347,14 @@ def fill_current_step(page, answers, args):
         if input_id and input_id in labeled_ids:
             continue  # already handled via label[for] above
         question_text = (field.get_attribute("aria-label") or "").strip()
-        if field.input_value():
-            continue
+        current = field.input_value()
         entry = match_answer(question_text, answers, ("text",), args.region)
         if entry:
-            field.fill(resolve_value(entry, args.region))
+            value = str(resolve_value(entry, args.region))
+            if current.strip() != value:
+                field.fill(value)
+            continue
+        if current:
             continue
         required = field.get_attribute("required") is not None or field.get_attribute("aria-required") == "true"
         if not required:
@@ -402,6 +444,40 @@ def fill_current_step(page, answers, args):
             target = inputs[0] if str(answer_value).strip().lower() in ("yes", "true") else inputs[1]
         (target or inputs[0]).evaluate("el => el.click()")
 
+    # Typeahead fields (e.g. the contact step's required "Location (city)") have no label[for] or
+    # aria-label -- the question is a sibling <p> -- so the loops above never see them, and an
+    # empty one pins the form to that step while Next keeps "succeeding". The value only counts
+    # once a suggestion is picked, so type it and choose the first match.
+    for ta in page.query_selector_all("input[data-testid='typeahead-input']"):
+        if ta.input_value():
+            continue
+        raw_question = ta.evaluate(
+            "el => (el.closest('[componentkey]')?.querySelector('p')?.innerText"
+            " || el.getAttribute('placeholder') || '').trim()"
+        )
+        question_text = raw_question.rstrip("*").strip()
+        entry = match_answer(question_text, answers, ("text",), args.region)
+        if entry:
+            value = resolve_value(entry, args.region)
+        elif raw_question.endswith("*"):
+            value = ask_and_wait(question_text, "text", None, args.answer_pipe)
+        else:
+            continue
+        ta.click()
+        ta.type(str(value), delay=60)
+        # Pick from *this* input's listbox (aria-owns) -- a bare [role='option'] can resolve to a
+        # hidden option of LinkedIn's global search typeahead, leaving the field typed-but-unselected.
+        owns = ta.get_attribute("aria-owns")
+        option_sel = f"[id='{owns}'] [role='option']" if owns else "[role='option']:visible"
+        try:
+            page.wait_for_selector(option_sel, state="visible", timeout=5000)
+            page.locator(option_sel).first.click(timeout=3000)
+        except Exception:
+            # Fall back to the keyboard: highlight the first suggestion and confirm it.
+            ta.press("ArrowDown")
+            ta.press("Enter")
+        page.wait_for_timeout(500)
+
 
 def cmd_apply(args):
     answers = load_json(args.answers, [])
@@ -418,13 +494,30 @@ def cmd_apply(args):
                 "xpath=//button[contains(@aria-label,'Easy Apply')] | "
                 "//*[self::a or self::button][contains(@aria-label,'Apply on company website')] | "
                 "//*[contains(text(),'No longer accepting applications')] | "
+                "//*[contains(text(),'Application submitted')] | "
                 "//button[contains(.,\"I'm interested\") or contains(.,\"I’m interested\")]"
             )
             try:
                 page.wait_for_selector(indicator_selector, timeout=15000)
             except PWTimeoutError:
-                log_event({"event": "error", "reason": "page did not settle (no apply indicator rendered)"})
+                # A removed listing redirects to a generic jobs page titled just "Jobs | LinkedIn".
+                if page.title().strip() == "Jobs | LinkedIn":
+                    log_event({"event": "error", "reason": "listing unavailable (removed)"})
+                else:
+                    log_event({"event": "error", "reason": "page did not settle (no apply indicator rendered)"})
                 return
+
+            # Applied earlier (by hand, or before seen_jobs.json tracked it): LinkedIn swaps the
+            # apply button for an "Application status / Application submitted" card. That text can
+            # also flash up transiently while the page hydrates, so only trust it once the page has
+            # settled and there is genuinely no Easy Apply button.
+            if page.query_selector("xpath=//*[contains(text(),'Application submitted')]"):
+                page.wait_for_timeout(3000)
+                submitted = page.locator("xpath=//*[contains(text(),'Application submitted')]")
+                if (page.locator("xpath=//button[contains(@aria-label,'Easy Apply')]").count() == 0
+                        and submitted.count() > 0 and submitted.first.is_visible()):
+                    log_event({"event": "error", "reason": "already applied"})
+                    return
 
             if page.query_selector("xpath=//*[contains(text(),'No longer accepting applications')]"):
                 log_event({"event": "error", "reason": "listing closed"})
